@@ -70,6 +70,9 @@ python3 claude_usage_stats.py --since 2026-06-01
 python3 claude_usage_stats.py --json          # machine-readable
 python3 claude_usage_stats.py --logs /path/to/projects
 python3 claude_usage_stats.py --live          # burn-rate vs. current windows
+python3 claude_usage_stats.py --classify llm  # accurate task labels via claude CLI
+python3 claude_usage_stats.py --calibrate     # infer caps from /usage
+python3 claude_usage_stats.py --csv weekly.csv # weekly trend export
 ```
 
 ### `--live` burn-rate view
@@ -141,13 +144,57 @@ have a few weeks of history, they tell you a typical refactor on Opus costs
 
 Sessions are auto-classified from the first user prompt into: `debug`,
 `feature`, `refactor`, `tests`, `docs`, `research`, `review`, `ops`, `other`.
-This is a keyword heuristic — tune the `CLASSIFY_RULES` list in the script, or
-override any session with a tag file:
+The default is a fast keyword heuristic — tune the `CLASSIFY_RULES` list in the
+script, or override any session with a tag file:
 
 ```bash
 # tags.json  ->  { "6533afa3-915f-...": "refactor", "1a2b...": "research" }
 python3 claude_usage_stats.py --tags tags.json
 ```
+
+**LLM classification (more accurate).** For better labels than keywords, use the
+local `claude` CLI — no API key needed, it reuses your existing Claude Code auth:
+
+```bash
+python3 claude_usage_stats.py --classify llm            # default model: haiku
+python3 claude_usage_stats.py --classify llm --classify-model sonnet
+```
+
+Each session is classified once and cached in `~/.claude/usage_classify_cache.json`,
+so repeated runs cost **zero** extra tokens. Prompts are batched (40 per call) and
+sent to a cheap model (Haiku) by default. If the CLI is missing or errors, it
+falls back to keyword classification automatically.
+
+### Auto-detect your plan caps from `/usage`
+
+Instead of guessing your limits, infer them. `/usage` tells you what *percent* of
+each window you've used; the tool knows how many *tokens* you've used from the
+logs, so it back-computes the cap (`cap = used ÷ percent`):
+
+```bash
+# 1. run /usage in Claude Code, read the two percentages, then:
+python3 claude_usage_stats.py --calibrate --pct-5h 58 --pct-weekly 24
+
+# ...or just paste the whole /usage output in and let it scrape the numbers:
+python3 claude_usage_stats.py --calibrate   # then paste, Ctrl-D
+```
+
+It writes `~/.claude/usage_limits.json` (merging, not clobbering), so every later
+`--live` / `/budget` run has real limits. Caps are approximate — inferred from
+local logs — so re-run occasionally to refine.
+
+### Weekly CSV export
+
+For tracking trends over weeks, export a summary grouped by ISO week × task × model:
+
+```bash
+python3 claude_usage_stats.py --csv weekly.csv
+python3 claude_usage_stats.py --csv weekly.csv --classify llm   # with LLM labels
+```
+
+Columns: `week_start, task, model, sessions, input_tokens, output_tokens,
+cache_write_tokens, cache_read_tokens, total_tokens, est_cost_usd` — ready to drop
+into a spreadsheet or plot.
 
 ### Caveats
 
@@ -161,7 +208,6 @@ python3 claude_usage_stats.py --tags tags.json
 
 ## Possible next steps
 
-- LLM-based classification (send the first prompt to Claude) for better accuracy
-  than keywords.
-- Auto-detect plan caps from `/usage` output so limits don't need to be set by hand.
-- Weekly summary export (CSV) for tracking trends.
+- A `--watch` auto-refreshing live dashboard (re-render every N seconds).
+- Trend charts rendered straight from the weekly CSV.
+- Per-project budgets, not just global windows.

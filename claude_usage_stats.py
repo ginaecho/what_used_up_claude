@@ -22,6 +22,19 @@ Usage:
     python3 claude_usage_stats.py --since 2026-06-01
     python3 claude_usage_stats.py --json          # machine-readable output
     python3 claude_usage_stats.py --logs /path/to/projects
+    python3 claude_usage_stats.py --live          # burn-rate vs current windows
+
+More accurate task types with an LLM (uses the local `claude` CLI, cached):
+    python3 claude_usage_stats.py --classify llm
+
+Auto-fill your plan caps from /usage (so --live has real limits):
+    /usage      # in Claude Code, read the two percentages, then:
+    python3 claude_usage_stats.py --calibrate --pct-5h 58 --pct-weekly 24
+    #   ...or pipe the pasted /usage text straight in:
+    /usage output | python3 claude_usage_stats.py --calibrate
+
+Weekly CSV export for tracking trends over time:
+    python3 claude_usage_stats.py --csv weekly.csv
 
 Tagging (optional, for accurate task types):
     Create a JSON file mapping session id -> task type and pass --tags tags.json
@@ -600,6 +613,245 @@ def report_live(logs_dir, now, limit_5h=None, limit_weekly=None):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# LLM-based classification (--classify llm)
+# Uses the local `claude` CLI headlessly, so it reuses the user's existing
+# Claude Code auth (no API key needed). Results are cached by session id so a
+# session is only ever classified once — repeated runs cost no tokens.
+# ---------------------------------------------------------------------------
+TASK_TYPES = ["debug", "feature", "refactor", "tests", "docs",
+              "research", "review", "ops", "other"]
+CLASSIFY_CACHE = Path(os.path.expanduser("~/.claude/usage_classify_cache.json"))
+
+
+def _extract_json(text):
+    """Pull the first {...} object out of an LLM reply (handles code fences)."""
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def _claude_classify_batch(prompts, model):
+    """Ask the claude CLI to classify a batch of prompts. prompts is a list of
+    strings; returns a list of task-type strings the same length, or None on
+    failure."""
+    import subprocess
+
+    listing = "\n".join(f"[{i}] {p[:300].replace(chr(10), ' ')}"
+                        for i, p in enumerate(prompts))
+    instruction = (
+        "You are labeling how a software engineer opened a coding session. "
+        "Classify each numbered prompt into EXACTLY ONE of these categories:\n"
+        f"{', '.join(TASK_TYPES)}.\n"
+        "Return ONLY a JSON object mapping the number (as a string) to its "
+        'category, e.g. {"0":"debug","1":"feature"}. No prose, no code fence.\n\n'
+        f"Prompts:\n{listing}"
+    )
+    cmd = ["claude", "-p", instruction]
+    if model:
+        cmd += ["--model", model]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"warn: llm classify call failed ({e}); is the `claude` CLI installed?",
+              file=sys.stderr)
+        return None
+    if res.returncode != 0:
+        # retry once without an explicit model in case the alias is unavailable
+        if model:
+            return _claude_classify_batch(prompts, model=None)
+        print(f"warn: `claude -p` returned {res.returncode}: {res.stderr.strip()[:200]}",
+              file=sys.stderr)
+        return None
+    data = _extract_json(res.stdout)
+    if not isinstance(data, dict):
+        print("warn: could not parse llm classification output; keeping keyword result",
+              file=sys.stderr)
+        return None
+    out = []
+    for i in range(len(prompts)):
+        val = str(data.get(str(i), "")).strip().lower()
+        out.append(val if val in TASK_TYPES else DEFAULT_TASK)
+    return out
+
+
+def llm_classify(sessions, model="haiku", batch=40, cache_path=CLASSIFY_CACHE,
+                 skip_ids=None):
+    """Classify sessions with the LLM, using and updating a persistent cache.
+    Sessions already tagged (via --tags, passed as skip_ids) keep their tag."""
+    skip_ids = skip_ids or set()
+    cache = {}
+    if cache_path and cache_path.exists():
+        try:
+            cache = json.loads(cache_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            cache = {}
+
+    todo = [s for s in sessions
+            if s.sid not in cache and s.sid not in skip_ids and s.first_prompt]
+    for s in sessions:
+        if s.sid in skip_ids:
+            continue
+        if s.sid in cache:
+            s.task = cache[s.sid]
+
+    if todo:
+        print(f"classifying {len(todo)} new session(s) with the LLM "
+              f"(model={model or 'default'})…", file=sys.stderr)
+    for i in range(0, len(todo), batch):
+        chunk = todo[i:i + batch]
+        labels = _claude_classify_batch([s.first_prompt for s in chunk], model)
+        if labels is None:
+            print("warn: falling back to keyword classification for the rest",
+                  file=sys.stderr)
+            break
+        for s, label in zip(chunk, labels):
+            s.task = label
+            cache[s.sid] = label
+
+    if cache_path and todo:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(cache, indent=0))
+        except OSError as e:
+            print(f"warn: could not write classify cache: {e}", file=sys.stderr)
+    return sessions
+
+
+# ---------------------------------------------------------------------------
+# Auto-calibrate limits from /usage (--calibrate)
+# /usage reports how much of each window you've consumed as a percentage. We
+# know the tokens consumed in each window from the logs, so we can back out the
+# implied cap:  cap = used / (percent / 100).
+# ---------------------------------------------------------------------------
+def parse_usage_percentages(text):
+    """Best-effort scrape of /usage output. Returns {'5h': pct, 'weekly': pct}
+    for whichever windows we can find. Pairs each 'NN%' with the nearest
+    preceding session/weekly keyword."""
+    import re
+    result = {}
+    tokens = re.split(r"(\n)", text)
+    # Simpler: scan line by line, remember the most recent window keyword.
+    window = None
+    for line in text.splitlines():
+        low = line.lower()
+        if any(k in low for k in ("session", "5-hour", "5 hour", "5h", "current session")):
+            window = "5h"
+        elif any(k in low for k in ("week", "weekly", "7-day", "7 day")):
+            window = "weekly"
+        m = re.search(r"(\d+(?:\.\d+)?)\s*%", line)
+        if m and window:
+            result[window] = float(m.group(1))
+    return result
+
+
+def calibrate_limits(logs_dir, now, pct_5h=None, pct_weekly=None,
+                     usage_text=None, out_path=None):
+    """Compute caps from window usage + consumed percentages, write config."""
+    if usage_text:
+        found = parse_usage_percentages(usage_text)
+        pct_5h = pct_5h if pct_5h is not None else found.get("5h")
+        pct_weekly = pct_weekly if pct_weekly is not None else found.get("weekly")
+
+    if pct_5h is None and pct_weekly is None:
+        print("Could not find any usage percentages. Either paste /usage output "
+              "on stdin, or pass --pct-5h N and/or --pct-weekly N with the "
+              "numbers you read off /usage.", file=sys.stderr)
+        return 1
+
+    events = collect_events(logs_dir)
+    cfg = {}
+    if pct_5h is not None:
+        bstart = current_block_start(events, now)
+        used, _ = _window_totals(events, bstart, now) if bstart else (0, 0)
+        if pct_5h <= 0:
+            print("warn: 5h usage is 0% — can't infer a cap from it, skipping.",
+                  file=sys.stderr)
+        elif used == 0:
+            print("warn: no logged tokens in the current 5h window — can't infer "
+                  "its cap, skipping.", file=sys.stderr)
+        else:
+            cap = int(round(used / (pct_5h / 100)))
+            cfg["limit_5h"] = human_tokens(cap)
+            print(f"5h: {human_tokens(used)} used = {pct_5h}%  ->  cap ~{human_tokens(cap)} tokens")
+    if pct_weekly is not None:
+        wstart = now - timedelta(hours=WEEK_HOURS)
+        used, _ = _window_totals(events, wstart, now)
+        if pct_weekly <= 0:
+            print("warn: weekly usage is 0% — can't infer a cap, skipping.",
+                  file=sys.stderr)
+        elif used == 0:
+            print("warn: no logged tokens in the last 7 days — can't infer the "
+                  "weekly cap, skipping.", file=sys.stderr)
+        else:
+            cap = int(round(used / (pct_weekly / 100)))
+            cfg["limit_weekly"] = human_tokens(cap)
+            print(f"weekly: {human_tokens(used)} used = {pct_weekly}%  ->  cap ~{human_tokens(cap)} tokens")
+
+    if not cfg:
+        print("Nothing to write.", file=sys.stderr)
+        return 1
+
+    out_path = out_path or Path(os.path.expanduser("~/.claude/usage_limits.json"))
+    # merge with any existing config so we don't clobber the other window
+    existing = {}
+    if out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+    existing.update(cfg)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(existing, indent=2) + "\n")
+    print(f"\nWrote {out_path}: {existing}")
+    print("Note: caps are inferred from local logs, so they're approximate — "
+          "if logs were pruned the weekly cap may read low. Re-run occasionally "
+          "to refine, or edit the file by hand.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Weekly CSV export (--csv)
+# ---------------------------------------------------------------------------
+def _iso_week_start(dt):
+    """Monday (UTC date) of the ISO week containing dt."""
+    d = dt.date()
+    return (d - timedelta(days=d.weekday())).isoformat()
+
+
+def export_csv(sessions, path):
+    import csv
+    # group by (week_start, task, model)
+    rows = defaultdict(lambda: {"sessions": set(), "inp": 0, "out": 0,
+                                "cw": 0, "cr": 0, "usd": 0.0})
+    for s in sessions:
+        ts = parse_ts(s.start) if s.start else None
+        week = _iso_week_start(ts) if ts else "unknown"
+        for model, (inp, out, cw, cr) in getattr(s, "_per_model", {}).items():
+            r = rows[(week, s.task, short_model(model))]
+            r["sessions"].add(s.sid)
+            r["inp"] += inp; r["out"] += out; r["cw"] += cw; r["cr"] += cr
+            r["usd"] += cost_usd(model, inp, out, cw, cr)
+
+    with open(path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["week_start", "task", "model", "sessions", "input_tokens",
+                    "output_tokens", "cache_write_tokens", "cache_read_tokens",
+                    "total_tokens", "est_cost_usd"])
+        for (week, task, model), r in sorted(rows.items()):
+            total = r["inp"] + r["out"] + r["cw"] + r["cr"]
+            w.writerow([week, task, model, len(r["sessions"]), r["inp"],
+                        r["out"], r["cw"], r["cr"], total, round(r["usd"], 4)])
+    print(f"Wrote {path}  ({len(rows)} week×task×model rows)")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Analyze Claude Code token usage by task type and model.")
     default_logs = Path(os.path.expanduser("~/.claude/projects"))
@@ -619,6 +871,22 @@ def main(argv=None):
     ap.add_argument("--limits", type=Path, metavar="FILE",
                     help="JSON file with default limits: "
                          '{"limit_5h": "2M", "limit_weekly": "$150"}')
+    ap.add_argument("--classify", choices=["keyword", "llm"], default="keyword",
+                    help="how to label task types (default: keyword). 'llm' uses "
+                         "the local `claude` CLI; results are cached per session.")
+    ap.add_argument("--classify-model", default="haiku", metavar="MODEL",
+                    help="model for --classify llm (default: haiku, cheap & fine)")
+    ap.add_argument("--csv", type=Path, metavar="FILE",
+                    help="export a weekly summary (week×task×model) to CSV and exit")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="infer your plan caps from /usage and write usage_limits.json. "
+                         "Paste /usage output on stdin, or use --pct-5h / --pct-weekly.")
+    ap.add_argument("--pct-5h", type=float, metavar="N",
+                    help="percent of your 5-hour limit used (from /usage), for --calibrate")
+    ap.add_argument("--pct-weekly", type=float, metavar="N",
+                    help="percent of your weekly limit used (from /usage), for --calibrate")
+    ap.add_argument("--usage-file", type=Path, metavar="FILE",
+                    help="file with pasted /usage output, for --calibrate (else stdin)")
     args = ap.parse_args(argv)
 
     # Load default limits from a config file if flags weren't given. Search
@@ -645,6 +913,17 @@ def main(argv=None):
               file=sys.stderr)
         return 1
 
+    if args.calibrate:
+        now = datetime.now(timezone.utc)
+        usage_text = None
+        if args.usage_file and args.usage_file.exists():
+            usage_text = args.usage_file.read_text()
+        elif args.pct_5h is None and args.pct_weekly is None and not sys.stdin.isatty():
+            usage_text = sys.stdin.read()
+        return calibrate_limits(args.logs, now, pct_5h=args.pct_5h,
+                                pct_weekly=args.pct_weekly, usage_text=usage_text,
+                                out_path=args.limits)
+
     if args.live:
         now = datetime.now(timezone.utc)
         return report_live(args.logs, now,
@@ -665,6 +944,14 @@ def main(argv=None):
     sessions = load_sessions(args.logs, since=since, tags=tags)
     if not sessions:
         print("No sessions with token usage found.", file=sys.stderr)
+        return 0
+
+    if args.classify == "llm":
+        llm_classify(sessions, model=args.classify_model,
+                     skip_ids=set(tags) if tags else None)
+
+    if args.csv:
+        export_csv(sessions, args.csv)
         return 0
 
     if args.json:
