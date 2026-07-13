@@ -35,8 +35,13 @@ import json
 import os
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Anthropic usage limits reset on a rolling 5-hour session window and a rolling
+# 7-day (weekly) window. Those are the two windows the --live view reports on.
+BLOCK_HOURS = 5
+WEEK_HOURS = 24 * 7
 
 # ---------------------------------------------------------------------------
 # Pricing.  Approximate USD per 1,000,000 tokens. Prices change over time and
@@ -337,6 +342,213 @@ def report_sessions(sessions):
                 aligns=["<", "<", "<", ">", ">", "<"])
 
 
+# ---------------------------------------------------------------------------
+# Live burn-rate view (--live)
+# ---------------------------------------------------------------------------
+def parse_ts(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def parse_limit(s):
+    """Parse a limit like '1000000', '1.5M', '500k', or '$50' (dollars).
+    Returns (value, is_dollars). None if unset."""
+    if not s:
+        return None
+    s = s.strip()
+    is_dollars = s.startswith("$")
+    if is_dollars:
+        s = s[1:]
+    mult = 1
+    if s and s[-1].lower() == "k":
+        mult, s = 1_000, s[:-1]
+    elif s and s[-1].lower() == "m":
+        mult, s = 1_000_000, s[:-1]
+    try:
+        return (float(s) * mult, is_dollars)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"bad limit: {s!r} (try 1.5M, 500k, or $50)")
+
+
+def collect_events(logs_dir: Path):
+    """Flat timeline of every assistant turn: (ts, model, inp, out, cw, cr)."""
+    events = []
+    for path in sorted(logs_dir.glob("**/*.jsonl")):
+        try:
+            with path.open(errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        o = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if o.get("type") != "assistant":
+                        continue
+                    ts = parse_ts(o.get("timestamp"))
+                    if not ts:
+                        continue
+                    msg = o.get("message", {})
+                    model = msg.get("model", "") or ""
+                    if model == "<synthetic>":
+                        continue
+                    u = msg.get("usage") or {}
+                    events.append((
+                        ts, model,
+                        u.get("input_tokens", 0) or 0,
+                        u.get("output_tokens", 0) or 0,
+                        u.get("cache_creation_input_tokens", 0) or 0,
+                        u.get("cache_read_input_tokens", 0) or 0,
+                    ))
+        except OSError:
+            continue
+    events.sort(key=lambda e: e[0])
+    return events
+
+
+def _window_totals(events, start, now):
+    """Sum tokens + cost for events in [start, now]."""
+    tok = 0
+    usd = 0.0
+    for ts, model, inp, out, cw, cr in events:
+        if start <= ts <= now:
+            tok += inp + out + cw + cr
+            usd += cost_usd(model, inp, out, cw, cr)
+    return tok, usd
+
+
+def current_block_start(events, now):
+    """Start of the active rolling 5-hour block, floored to the hour, using the
+    same gap-based block model as ccusage: a fresh block begins after a >=5h
+    idle gap. Returns None if there's been no activity in the last 5 hours."""
+    block_delta = timedelta(hours=BLOCK_HOURS)
+    start = None
+    last = None
+    for ts, *_ in events:
+        if start is None:
+            start = ts.replace(minute=0, second=0, microsecond=0)
+            last = ts
+        else:
+            if ts >= start + block_delta or ts - last >= block_delta:
+                start = ts.replace(minute=0, second=0, microsecond=0)
+            last = ts
+    if start is None or last is None:
+        return None
+    # The block is only "active" if we're still inside its 5h window.
+    if now - start >= block_delta:
+        return None
+    return start
+
+
+def _bar(frac, width=24):
+    frac = max(0.0, min(1.0, frac))
+    filled = int(round(frac * width))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _fmt_dur(td):
+    mins = int(td.total_seconds() // 60)
+    h, m = divmod(mins, 60)
+    return f"{h}h{m:02d}m" if h else f"{m}m"
+
+
+def report_window(name, tok, usd, start, end, now, limit):
+    elapsed = now - start
+    total_span = end - start
+    remaining = end - now
+    print(f"\n=== {name} ===")
+    print(f"  window   {start:%Y-%m-%d %H:%M} -> {end:%H:%M} UTC   "
+          f"({_fmt_dur(elapsed)} elapsed, {_fmt_dur(remaining)} left)")
+    print(f"  used     {human_tokens(tok)} tokens   ~${usd:.2f}")
+
+    elapsed_min = max(elapsed.total_seconds() / 60, 1)
+    span_min = total_span.total_seconds() / 60
+    # burn rate and straight-line projection to the end of the window
+    tok_rate = tok / elapsed_min           # tokens per minute
+    usd_rate = usd / elapsed_min
+    proj_tok = tok + tok_rate * (remaining.total_seconds() / 60)
+    proj_usd = usd + usd_rate * (remaining.total_seconds() / 60)
+    print(f"  burn     {human_tokens(int(tok_rate*60))}/hr   ~${usd_rate*60:.2f}/hr")
+    print(f"  project  {human_tokens(int(proj_tok))} tokens   ~${proj_usd:.2f}  "
+          f"at end of window (current pace)")
+
+    if limit:
+        lim_val, lim_dollars = limit
+        used = usd if lim_dollars else tok
+        proj = proj_usd if lim_dollars else proj_tok
+        unit = "$" if lim_dollars else "tok"
+        frac = used / lim_val if lim_val else 0
+        show_used = f"${used:.2f}" if lim_dollars else human_tokens(int(used))
+        show_lim = f"${lim_val:.0f}" if lim_dollars else human_tokens(int(lim_val))
+        print(f"  limit    {_bar(frac)} {frac*100:4.0f}%  "
+              f"({show_used} / {show_lim} {unit})")
+        # when will we hit the limit at current pace?
+        rate = usd_rate if lim_dollars else tok_rate
+        if used >= lim_val:
+            print("  ETA      limit already reached")
+        elif rate > 0:
+            mins_left = (lim_val - used) / rate
+            eta = now + timedelta(minutes=mins_left)
+            within = "within this window" if eta <= end else "after window resets"
+            print(f"  ETA      ~{_fmt_dur(timedelta(minutes=mins_left))} to limit "
+                  f"({eta:%H:%M} UTC, {within})")
+            if proj >= lim_val:
+                print("  WARNING  projected to EXCEED the limit before the window ends")
+
+
+def report_live(logs_dir, now, limit_5h=None, limit_weekly=None):
+    events = collect_events(logs_dir)
+    if not events:
+        print("No assistant activity found in logs.", file=sys.stderr)
+        return 0
+
+    print(f"Live usage as of {now:%Y-%m-%d %H:%M} UTC   "
+          f"({len(events)} turns across all sessions on record)")
+
+    # 5-hour rolling session window
+    bstart = current_block_start(events, now)
+    if bstart is None:
+        last_ts = events[-1][0]
+        print(f"\n=== 5-hour session window ===")
+        print(f"  idle — no activity in the last {BLOCK_HOURS}h "
+              f"(last turn {_fmt_dur(now - last_ts)} ago). Window is clear.")
+    else:
+        bend = bstart + timedelta(hours=BLOCK_HOURS)
+        tok, usd = _window_totals(events, bstart, now)
+        report_window("5-hour session window", tok, usd, bstart, bend, now, limit_5h)
+
+    # rolling 7-day weekly window
+    wstart = now - timedelta(hours=WEEK_HOURS)
+    wend = now  # rolling window ends "now"; report against last 7 days
+    wtok, wusd = _window_totals(events, wstart, now)
+    # For the weekly view, projection to a fixed end isn't meaningful (it's a
+    # trailing window), so report consumption + daily burn instead.
+    print(f"\n=== 7-day rolling window ===")
+    print(f"  window   {wstart:%Y-%m-%d %H:%M} -> now   (trailing 7 days)")
+    print(f"  used     {human_tokens(wtok)} tokens   ~${wusd:.2f}")
+    days = WEEK_HOURS / 24
+    print(f"  burn     {human_tokens(int(wtok/days))}/day   ~${wusd/days:.2f}/day")
+    if limit_weekly:
+        lim_val, lim_dollars = limit_weekly
+        used = wusd if lim_dollars else wtok
+        frac = used / lim_val if lim_val else 0
+        show_used = f"${used:.2f}" if lim_dollars else human_tokens(int(used))
+        show_lim = f"${lim_val:.0f}" if lim_dollars else human_tokens(int(lim_val))
+        unit = "$" if lim_dollars else "tok"
+        print(f"  limit    {_bar(frac)} {frac*100:4.0f}%  "
+              f"({show_used} / {show_lim} {unit})")
+
+    print("\nNote: windows are reconstructed from local logs; limits are whatever "
+          "you pass via --limit-5h / --limit-weekly (Claude Code doesn't record "
+          "your plan's exact caps). Dollar figures are approximate.")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Analyze Claude Code token usage by task type and model.")
     default_logs = Path(os.path.expanduser("~/.claude/projects"))
@@ -347,12 +559,23 @@ def main(argv=None):
     ap.add_argument("--since", help="only sessions on/after this date (YYYY-MM-DD)")
     ap.add_argument("--tags", type=Path, help="JSON file mapping session id -> task type")
     ap.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    ap.add_argument("--live", action="store_true",
+                    help="show burn-rate against the current 5-hour and 7-day windows")
+    ap.add_argument("--limit-5h", type=parse_limit, metavar="N",
+                    help="your 5-hour cap for the --live gauge, e.g. 1.5M, 500k, or $20")
+    ap.add_argument("--limit-weekly", type=parse_limit, metavar="N",
+                    help="your weekly cap for the --live gauge, e.g. 20M or $150")
     args = ap.parse_args(argv)
 
     if not args.logs.exists():
         print(f"No log directory at {args.logs}. Is Claude Code installed / has it run?",
               file=sys.stderr)
         return 1
+
+    if args.live:
+        now = datetime.now(timezone.utc)
+        return report_live(args.logs, now,
+                           limit_5h=args.limit_5h, limit_weekly=args.limit_weekly)
 
     since = None
     if args.since:

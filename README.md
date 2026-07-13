@@ -36,7 +36,36 @@ python3 claude_usage_stats.py --by session    # one row per session
 python3 claude_usage_stats.py --since 2026-06-01
 python3 claude_usage_stats.py --json          # machine-readable
 python3 claude_usage_stats.py --logs /path/to/projects
+python3 claude_usage_stats.py --live          # burn-rate vs. current windows
 ```
+
+### `--live` burn-rate view
+
+Reconstructs your **current rolling 5-hour session window** and **trailing
+7-day window** from the logs and shows what you've spent, your burn rate, and a
+straight-line projection to the end of the 5-hour window:
+
+```bash
+python3 claude_usage_stats.py --live
+python3 claude_usage_stats.py --live --limit-5h 2M --limit-weekly '$150'
+```
+
+```
+=== 5-hour session window ===
+  window   2026-07-13 10:00 -> 15:00 UTC   (1h22m elapsed, 3h37m left)
+  used     3.3M tokens   ~$14.18
+  burn     2.4M/hr   ~$10.30/hr
+  project  11.8M tokens   ~$51.51  at end of window (current pace)
+  limit    [################--------]   65%  (3.3M / 5.0M tok)
+  ETA      ~44m to limit (12:06 UTC, within this window)
+  WARNING  projected to EXCEED the limit before the window ends
+```
+
+Claude Code doesn't record your plan's actual caps, so the gauge, ETA, and
+warning only appear when you supply them with `--limit-5h` / `--limit-weekly`.
+Both accept tokens (`1.5M`, `500k`) or dollars (`$20`). Without limits you still
+get consumption + burn rate. If you've been idle more than 5 hours the session
+window reports as clear.
 
 Example output:
 
