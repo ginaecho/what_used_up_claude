@@ -23,6 +23,8 @@ Usage:
     python3 claude_usage_stats.py --json          # machine-readable output
     python3 claude_usage_stats.py --logs /path/to/projects
     python3 claude_usage_stats.py --live          # burn-rate vs current windows
+    python3 claude_usage_stats.py --watch         # auto-refresh the live view (10s)
+    python3 claude_usage_stats.py --chart w.csv   # ASCII weekly-trend chart
 
 More accurate task types with an LLM (uses the local `claude` CLI, cached):
     python3 claude_usage_stats.py --classify llm
@@ -852,6 +854,89 @@ def export_csv(sessions, path):
     print(f"Wrote {path}  ({len(rows)} week×task×model rows)")
 
 
+# ---------------------------------------------------------------------------
+# Auto-refreshing live dashboard (--watch)
+# ---------------------------------------------------------------------------
+def run_watch(logs_dir, interval, limit_5h, limit_weekly, cycles=0):
+    """Re-render the --live view every `interval` seconds until Ctrl-C.
+    cycles>0 runs a bounded number of refreshes (used by tests)."""
+    import time
+    CLEAR = "\033[2J\033[H"  # clear screen + cursor home
+    n = 0
+    try:
+        while True:
+            now = datetime.now(timezone.utc)
+            sys.stdout.write(CLEAR)
+            print(f"⟳ live dashboard — refreshing every {interval}s "
+                  f"(Ctrl-C to stop)   {now:%H:%M:%S} UTC")
+            report_live(logs_dir, now, limit_5h=limit_5h, limit_weekly=limit_weekly)
+            sys.stdout.flush()
+            n += 1
+            if cycles and n >= cycles:
+                return 0
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nstopped.")
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# ASCII trend charts from the weekly CSV (--chart)
+# ---------------------------------------------------------------------------
+def _read_weekly_csv(path):
+    import csv
+    weeks = defaultdict(lambda: {"tok": 0, "usd": 0.0, "by_task": defaultdict(int)})
+    with open(path, newline="") as fh:
+        for row in csv.DictReader(fh):
+            wk = row.get("week_start", "?")
+            try:
+                tok = int(row.get("total_tokens", 0) or 0)
+                usd = float(row.get("est_cost_usd", 0) or 0)
+            except ValueError:
+                continue
+            weeks[wk]["tok"] += tok
+            weeks[wk]["usd"] += usd
+            weeks[wk]["by_task"][row.get("task", "?")] += tok
+    return weeks
+
+
+def render_trend(path, width=40):
+    """Render an ASCII weekly-trend chart from a CSV produced by --csv."""
+    if not Path(path).exists():
+        print(f"No CSV at {path}. Generate one first: "
+              f"python3 claude_usage_stats.py --csv {path}", file=sys.stderr)
+        return 1
+    weeks = _read_weekly_csv(path)
+    if not weeks:
+        print(f"No rows in {path}.", file=sys.stderr)
+        return 1
+
+    ordered = sorted(weeks.items())
+    peak = max(w["tok"] for _, w in ordered) or 1
+    print(f"Weekly token usage trend  ({path})\n")
+    for wk, w in ordered:
+        bar_len = int(round(w["tok"] / peak * width))
+        bar = "█" * bar_len if bar_len else "▏"
+        top_task = max(w["by_task"].items(), key=lambda kv: kv[1])[0] if w["by_task"] else "-"
+        print(f"  {wk}  {bar:<{width}}  {human_tokens(w['tok']):>6}  "
+              f"~${w['usd']:>7.2f}   top: {top_task}")
+
+    total_tok = sum(w["tok"] for _, w in ordered)
+    total_usd = sum(w["usd"] for _, w in ordered)
+    n = len(ordered)
+    print(f"\n  {n} week(s)   total {human_tokens(total_tok)} tokens  ~${total_usd:.2f}"
+          f"   avg {human_tokens(total_tok // n)}/wk")
+
+    # week-over-week delta on the most recent pair
+    if n >= 2:
+        prev, last = ordered[-2][1]["tok"], ordered[-1][1]["tok"]
+        if prev:
+            delta = (last - prev) / prev * 100
+            arrow = "▲" if delta >= 0 else "▼"
+            print(f"  latest week {arrow} {abs(delta):.0f}% vs prior week")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Analyze Claude Code token usage by task type and model.")
     default_logs = Path(os.path.expanduser("~/.claude/projects"))
@@ -887,6 +972,12 @@ def main(argv=None):
                     help="percent of your weekly limit used (from /usage), for --calibrate")
     ap.add_argument("--usage-file", type=Path, metavar="FILE",
                     help="file with pasted /usage output, for --calibrate (else stdin)")
+    ap.add_argument("--watch", nargs="?", type=int, const=10, metavar="SECONDS",
+                    help="auto-refresh the live dashboard every N seconds (default 10)")
+    ap.add_argument("--watch-cycles", type=int, default=0,
+                    help=argparse.SUPPRESS)  # bounded refreshes, for testing
+    ap.add_argument("--chart", type=Path, metavar="CSV",
+                    help="render an ASCII weekly-trend chart from a --csv export")
     args = ap.parse_args(argv)
 
     # Load default limits from a config file if flags weren't given. Search
@@ -908,10 +999,18 @@ def main(argv=None):
                 args.limit_weekly = parse_limit(str(data["limit_weekly"]))
             break
 
+    # --chart reads a CSV, not the logs, so handle it before the logs check.
+    if args.chart:
+        return render_trend(args.chart)
+
     if not args.logs.exists():
         print(f"No log directory at {args.logs}. Is Claude Code installed / has it run?",
               file=sys.stderr)
         return 1
+
+    if args.watch is not None:
+        return run_watch(args.logs, args.watch, limit_5h=args.limit_5h,
+                         limit_weekly=args.limit_weekly, cycles=args.watch_cycles)
 
     if args.calibrate:
         now = datetime.now(timezone.utc)

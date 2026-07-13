@@ -73,6 +73,8 @@ python3 claude_usage_stats.py --live          # burn-rate vs. current windows
 python3 claude_usage_stats.py --classify llm  # accurate task labels via claude CLI
 python3 claude_usage_stats.py --calibrate     # infer caps from /usage
 python3 claude_usage_stats.py --csv weekly.csv # weekly trend export
+python3 claude_usage_stats.py --watch         # auto-refreshing live dashboard
+python3 claude_usage_stats.py --chart weekly.csv # ASCII trend chart
 ```
 
 ### `--live` burn-rate view
@@ -196,6 +198,43 @@ Columns: `week_start, task, model, sessions, input_tokens, output_tokens,
 cache_write_tokens, cache_read_tokens, total_tokens, est_cost_usd` — ready to drop
 into a spreadsheet or plot.
 
+**Trend chart, no spreadsheet needed.** Render the CSV as an ASCII bar chart of
+weekly token usage right in the terminal:
+
+```bash
+python3 claude_usage_stats.py --csv weekly.csv     # generate
+python3 claude_usage_stats.py --chart weekly.csv   # visualize
+```
+
+```
+Weekly token usage trend  (weekly.csv)
+
+  2026-06-15  ██████                                       30k  ~$   1.70   top: feature
+  2026-06-22  ████████████████                             86k  ~$   5.40   top: refactor
+  2026-06-29  ▏                                             2k  ~$   0.02   top: docs
+  2026-07-06  ████████████████████████████████           168k  ~$  12.00   top: research
+  2026-07-13  ████████████████████████████████████████   212k  ~$   4.80   top: feature
+
+  5 week(s)   total 498k tokens  ~$23.92   avg 100k/wk
+  latest week ▲ 26% vs prior week
+```
+
+Bars scale to the busiest week; each row shows the dominant task type, and the
+footer gives the week-over-week change.
+
+### `--watch`: auto-refreshing live dashboard
+
+Turn the `--live` view into a dashboard that redraws on an interval — handy to
+keep open in a spare terminal while you work:
+
+```bash
+python3 claude_usage_stats.py --watch          # refresh every 10s
+python3 claude_usage_stats.py --watch 5        # every 5s
+```
+
+It clears and re-renders the 5-hour + 7-day windows (with your limits and
+recommendations if configured) each cycle. Press **Ctrl-C** to stop.
+
 ### Caveats
 
 - **Dollar figures are approximate.** Prices live in the `PRICING` dict at the
@@ -208,6 +247,6 @@ into a spreadsheet or plot.
 
 ## Possible next steps
 
-- A `--watch` auto-refreshing live dashboard (re-render every N seconds).
-- Trend charts rendered straight from the weekly CSV.
 - Per-project budgets, not just global windows.
+- HTML/PNG chart export (the ASCII chart covers the terminal case today).
+- Auto-refresh the LLM classifier as new sessions land.
