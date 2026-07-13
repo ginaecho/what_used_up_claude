@@ -501,6 +501,53 @@ def report_window(name, tok, usd, start, end, now, limit):
                 print("  WARNING  projected to EXCEED the limit before the window ends")
 
 
+def task_averages(logs_dir):
+    """Per-task-type averages across all history: {task: (n, avg_tok, avg_usd)}."""
+    sessions = load_sessions(logs_dir)
+    agg = defaultdict(lambda: {"n": 0, "tok": 0, "usd": 0.0})
+    for s in sessions:
+        a = agg[s.task]
+        a["n"] += 1
+        a["tok"] += s.total_tokens
+        a["usd"] += session_cost(s)
+    out = {}
+    for task, a in agg.items():
+        out[task] = (a["n"], a["tok"] / a["n"], a["usd"] / a["n"])
+    return out
+
+
+def recommend_tasks(logs_dir, remaining, is_dollars, reset_time):
+    """Given remaining budget in the current 5-hour window, say which task
+    types still fit at their historical average size."""
+    avgs = task_averages(logs_dir)
+    if not avgs:
+        return
+    fmt_rem = f"${remaining:.2f}" if is_dollars else f"{human_tokens(int(remaining))} tokens"
+    print(f"\n=== What fits in your remaining 5-hour budget ({fmt_rem}) ===")
+    if remaining <= 0:
+        print(f"  nothing — window is spent. Resets at {reset_time:%H:%M} UTC.")
+        return
+    rows = []
+    for task, (n, avg_tok, avg_usd) in avgs.items():
+        avg = avg_usd if is_dollars else avg_tok
+        show_avg = f"${avg_usd:.2f}" if is_dollars else human_tokens(int(avg_tok))
+        if avg <= 0:
+            continue
+        how_many = int(remaining // avg)
+        if how_many >= 2:
+            verdict = f"OK    ~{how_many} more"
+        elif how_many == 1:
+            verdict = "TIGHT ~1 more"
+        else:
+            verdict = "OVER  wait for reset"
+        rows.append((avg, [task, f"avg {show_avg}", f"n={n}", verdict]))
+    rows.sort(key=lambda r: r[0])  # cheapest task first
+    print_table([r[1] for r in rows], ["task", "typical cost", "history", "verdict"],
+                aligns=["<", ">", ">", "<"])
+    print("  (based on your historical per-task averages; a bigger-than-usual "
+          "task of any type can still blow the budget)")
+
+
 def report_live(logs_dir, now, limit_5h=None, limit_weekly=None):
     events = collect_events(logs_dir)
     if not events:
@@ -521,6 +568,10 @@ def report_live(logs_dir, now, limit_5h=None, limit_weekly=None):
         bend = bstart + timedelta(hours=BLOCK_HOURS)
         tok, usd = _window_totals(events, bstart, now)
         report_window("5-hour session window", tok, usd, bstart, bend, now, limit_5h)
+        if limit_5h:
+            lim_val, lim_dollars = limit_5h
+            used = usd if lim_dollars else tok
+            recommend_tasks(logs_dir, lim_val - used, lim_dollars, bend)
 
     # rolling 7-day weekly window
     wstart = now - timedelta(hours=WEEK_HOURS)
@@ -565,7 +616,29 @@ def main(argv=None):
                     help="your 5-hour cap for the --live gauge, e.g. 1.5M, 500k, or $20")
     ap.add_argument("--limit-weekly", type=parse_limit, metavar="N",
                     help="your weekly cap for the --live gauge, e.g. 20M or $150")
+    ap.add_argument("--limits", type=Path, metavar="FILE",
+                    help="JSON file with default limits: "
+                         '{"limit_5h": "2M", "limit_weekly": "$150"}')
     args = ap.parse_args(argv)
+
+    # Load default limits from a config file if flags weren't given. Search
+    # order: --limits FILE, then ./usage_limits.json, then ~/.claude/usage_limits.json
+    cfg_candidates = [args.limits] if args.limits else [
+        Path("usage_limits.json"),
+        Path(os.path.expanduser("~/.claude/usage_limits.json")),
+    ]
+    for cfg in cfg_candidates:
+        if cfg and cfg.exists():
+            try:
+                data = json.loads(cfg.read_text())
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"warn: could not read limits file {cfg}: {e}", file=sys.stderr)
+                break
+            if args.limit_5h is None and data.get("limit_5h"):
+                args.limit_5h = parse_limit(str(data["limit_5h"]))
+            if args.limit_weekly is None and data.get("limit_weekly"):
+                args.limit_weekly = parse_limit(str(data["limit_weekly"]))
+            break
 
     if not args.logs.exists():
         print(f"No log directory at {args.logs}. Is Claude Code installed / has it run?",

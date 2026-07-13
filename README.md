@@ -23,6 +23,39 @@ Yes, and most of the plumbing already exists:
 actually answers *"the limit's close, what's cheap enough to still do?"* — and
 it's what this repo adds.
 
+## Quickest path: the `/budget` slash command
+
+Install once, then type **`/budget`** in any Claude Code session:
+
+```bash
+./install.sh --limit-5h 2M --limit-weekly '$150'
+# (run /usage in Claude Code once to find your real caps)
+```
+
+This copies the analyzer and a `/budget` command into `~/.claude/`. When you run
+`/budget`, Claude runs the analyzer and gives you a short briefing:
+
+1. **Where your tokens go** — the costliest task types per model, and whether a
+   cheaper model would do.
+2. **Right now** — how much of your 5-hour window is left and your burn rate.
+3. **What to do next** — which task types are safe to start now, which to hold
+   until the window resets, and roughly how many of each you can still fit.
+
+That last part is exactly *"with the usage I have left, what task is proper to
+do?"* — computed from your own historical per-task averages.
+
+### Does it count subagents / "all LLM usage"?
+
+**Yes.** Claude Code logs subagent (Task tool) turns into the same session file
+as `isSidechain: true` entries, each with its own `usage` and `model`. The
+analyzer sums **every** assistant turn, so subagent tokens are already included
+in every total, average, and burn-rate figure.
+
+The one boundary: this reads **Claude Code** logs only. If you also chat in the
+**claude.ai web app** (a separate product that shares your subscription's
+limit), those conversations aren't in these logs and can't be counted here.
+Everything you do *in Claude Code* — main agent + all subagents — is covered.
+
 ## The tool: `claude_usage_stats.py`
 
 Pure Python standard library, no network. It reads your local logs, classifies
@@ -61,10 +94,32 @@ python3 claude_usage_stats.py --live --limit-5h 2M --limit-weekly '$150'
   WARNING  projected to EXCEED the limit before the window ends
 ```
 
-Claude Code doesn't record your plan's actual caps, so the gauge, ETA, and
-warning only appear when you supply them with `--limit-5h` / `--limit-weekly`.
-Both accept tokens (`1.5M`, `500k`) or dollars (`$20`). Without limits you still
-get consumption + burn rate. If you've been idle more than 5 hours the session
+When limits are set, `--live` also prints a recommendation table — which task
+types still fit in the remaining 5-hour budget, at their historical average
+size:
+
+```
+=== What fits in your remaining 5-hour budget (14.7M tokens) ===
+task      typical cost  history  verdict
+--------  ------------  -------  ---------------
+docs           avg 24k      n=8  OK    ~600 more
+tests         avg 120k      n=5  OK    ~120 more
+refactor      avg 1.2M      n=4  OK    ~12 more
+research      avg 5.3M      n=2  OK    ~2 more
+```
+
+Claude Code doesn't record your plan's actual caps, so the gauge, ETA,
+warning, and recommendations only appear when limits are known. Provide them
+via `--limit-5h` / `--limit-weekly` (tokens like `1.5M`/`500k`, or dollars like
+`$20`), or set them once in a config file so you never pass flags:
+
+```bash
+# usage_limits.json (searched in ./ then ~/.claude/), or pass --limits FILE
+{ "limit_5h": "2M", "limit_weekly": "$150" }
+```
+
+Copy `usage_limits.example.json` to get started. Without limits you still get
+consumption + burn rate. If you've been idle more than 5 hours the session
 window reports as clear.
 
 Example output:
@@ -108,5 +163,5 @@ python3 claude_usage_stats.py --tags tags.json
 
 - LLM-based classification (send the first prompt to Claude) for better accuracy
   than keywords.
-- A `--live` burn-rate view against the current 5-hour / weekly window.
+- Auto-detect plan caps from `/usage` output so limits don't need to be set by hand.
 - Weekly summary export (CSV) for tracking trends.
