@@ -1,4 +1,4 @@
-# what_used_up_claude
+# claude-usage-statics
 
 Understand **what kinds of task burn how many tokens**, per model, so that when
 your Claude usage limit is approaching you can pick a task that fits the budget
