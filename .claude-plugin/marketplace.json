@@ -1,0 +1,12 @@
+{
+  "name": "claude-usage-statics",
+  "owner": { "name": "ginaecho" },
+  "description": "Token-usage analytics for Claude Code: per-task / per-model stats, a live burn-rate dashboard, budget recommendations, and weekly trend charts.",
+  "plugins": [
+    {
+      "name": "usage-stats",
+      "source": "./",
+      "description": "Analyze Claude Code token usage by task type and model. Adds /usage-stats:budget — a briefing on where your tokens go and what fits your remaining limit."
+    }
+  ]
+}

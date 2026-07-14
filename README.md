@@ -23,17 +23,42 @@ Yes, and most of the plumbing already exists:
 actually answers *"the limit's close, what's cheap enough to still do?"* — and
 it's what this repo adds.
 
-## Quickest path: the `/budget` slash command
+## Install once, use in every project
 
-Install once, then type **`/budget`** in any Claude Code session:
+You do **not** need to clone this into each repo. Pick either route below and the
+command is then available in every Claude Code session, in any folder.
+
+### Recommended: install as a plugin
+
+This repo is a Claude Code plugin **marketplace**. Two commands and you're done —
+the plugin bundles the analyzer script, so there's nothing to copy or `cd` into:
+
+```
+/plugin marketplace add ginaecho/claude-usage-statics
+/plugin install usage-stats@claude-usage-statics
+```
+
+Then, in any project, run **`/usage-stats:budget`**. To update later:
+`/plugin marketplace update claude-usage-statics`.
+
+> Why a plugin and not a VS Code / Cursor extension? Those extensions only *host*
+> Claude Code — they don't add capabilities to it. Claude Code's own plugin system
+> is the mechanism that makes a command available everywhere.
+
+### Alternative: manual global install
+
+If you'd rather not use the plugin system, the installer copies the analyzer and a
+`/budget` command into `~/.claude/` (still global, works in every project):
 
 ```bash
+git clone https://github.com/ginaecho/claude-usage-statics.git
+cd claude-usage-statics
 ./install.sh --limit-5h 2M --limit-weekly '$150'
 # (run /usage in Claude Code once to find your real caps)
 ```
 
-This copies the analyzer and a `/budget` command into `~/.claude/`. When you run
-`/budget`, Claude runs the analyzer and gives you a short briefing:
+Either way, when you run the command Claude runs the analyzer and gives you a short
+briefing:
 
 1. **Where your tokens go** — the costliest task types per model, and whether a
    cheaper model would do.
@@ -247,6 +272,7 @@ recommendations if configured) each cycle. Press **Ctrl-C** to stop.
 
 ## Possible next steps
 
+- An **MCP server ("connector")** wrapper so Claude can call the stats as an
+  autonomous tool ("check my usage") instead of you typing a command.
 - Per-project budgets, not just global windows.
 - HTML/PNG chart export (the ASCII chart covers the terminal case today).
-- Auto-refresh the LLM classifier as new sessions land.

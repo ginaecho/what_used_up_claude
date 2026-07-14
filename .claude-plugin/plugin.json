@@ -1,0 +1,8 @@
+{
+  "name": "usage-stats",
+  "version": "0.1.0",
+  "description": "Analyze Claude Code token usage by task type and model — /budget briefing, live burn-rate dashboard, /usage cap calibration, and weekly trend charts. Reads local session logs only; counts subagents; no API key needed.",
+  "author": { "name": "ginaecho" },
+  "repository": "https://github.com/ginaecho/claude-usage-statics",
+  "keywords": ["usage", "tokens", "cost", "budget", "analytics", "burn-rate"]
+}
